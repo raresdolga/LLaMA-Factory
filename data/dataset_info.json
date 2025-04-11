@@ -94,6 +94,14 @@
     "hf_hub_url": "llamafactory/alpaca_gpt4_en",
     "ms_hub_url": "llamafactory/alpaca_gpt4_en"
   },
+  "alpaca_math_instruct": {
+    "hf_hub_url": "TIGER-Lab/MathInstruct",
+    "ms_hub_url": "TIGER-Lab/MathInstruct",
+    "columns": {
+      "prompt": "instruction",
+      "response": "output"
+    }
+  },
   "alpaca_gpt4_zh": {
     "hf_hub_url": "llamafactory/alpaca_gpt4_zh",
     "ms_hub_url": "llamafactory/alpaca_gpt4_zh",

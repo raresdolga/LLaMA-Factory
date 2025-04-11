@@ -176,3 +176,7 @@ output/
 wandb/
 swanlog/
 generated_predictions.jsonl
+
+
+## Rares custom
+large_data
