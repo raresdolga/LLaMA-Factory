@@ -18,7 +18,7 @@ dataset: alpaca_math_instruct
 tokenized_path: ./large_data/input/alpaca_math_instruct
 template: alpaca
 cutoff_len: 2048
-max_samples: 1000
+max_samples: null
 overwrite_cache: true
 preprocessing_num_workers: 16
 dataloader_num_workers: 4
@@ -33,7 +33,7 @@ save_only_model: false
 report_to: none  # choices: [none, wandb, tensorboard, swanlab, mlflow]
 
 ### train
-per_device_train_batch_size: 1
+per_device_train_batch_size: 4
 gradient_accumulation_steps: 2
 learning_rate: 1.0e-5
 num_train_epochs: 3.0
@@ -42,7 +42,7 @@ warmup_ratio: 0.1
 bf16: true
 ddp_timeout: 180000000
 resume_from_checkpoint: null
-
+num_train_epochs: 1
 ### eval
 # val_size: 0.1
 # per_device_eval_batch_size: 1
