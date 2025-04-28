@@ -1,4 +1,3 @@
-import copy
 import random
 
 import numpy as np
@@ -43,17 +42,68 @@ class PairedTensorDataset(Dataset):
         return data, conv
 
 
+class Storage(Dataset):
+    N_SAMPLES = 3
+
+    def __init__(self, promt, neg_samples, old_log_probs, q):
+        self.promt = promt
+        self.samples = neg_samples.permute(1, 0, 2)
+        self.old_log_probs = old_log_probs.permute(1, 0, 2)
+        self.q = q.permute(1, 0)
+
+    @classmethod
+    def generate_samples(cls, input_ids, conv, model, device):
+        prompts = input_ids[:, : -conv.shape[1]]
+        with torch.no_grad():
+            generated_samples, log_probs_samples, _ = sample_with_probsV2(
+                model,
+                {"input_ids": prompts},
+                conv,
+                n=cls.N_SAMPLES,
+                max_new_tokens=conv.shape[1],
+                temperature=1.0,
+                device=device,
+            )
+
+        generated_samples = generated_samples.to(device)
+        log_probs_samples = log_probs_samples.to(device)
+        # add the true label
+        with torch.no_grad():
+            outputs = model(input_ids=input_ids)
+            log_probs = F.log_softmax(outputs.logits, dim=-1)
+            log_probs = log_probs[:, prompts.shape[-1] - 1 : -1, :]
+
+        log_probs = log_probs.gather(dim=-1, index=conv.unsqueeze(-1))
+        log_probs = log_probs.squeeze(-1)
+        # The true label is always the last sample
+        generated_samples = torch.cat([generated_samples, conv.unsqueeze(0)], dim=0)
+        log_probs_samples = torch.cat([log_probs_samples, log_probs.unsqueeze(0)], dim=0)
+        q, _ = compute_variationalOld(generated_samples, log_probs_samples)
+        return cls(prompts, generated_samples, log_probs_samples, q)
+
+    def __len__(self):
+        return self.promt.shape[0]
+
+    def __getitem__(self, idx):
+        return self.promt[idx], self.samples[idx], self.old_log_probs[idx], self.q[idx]
+
+    def __getitems__(self, idx):
+        return self.promt[idx], self.samples[idx], self.old_log_probs[idx], self.q[idx]
+
+
 def collate_fn(batch):
-    data, conv = batch  # (*batch)
-    # data = torch.stack(data, dim=0)
-    # conv = torch.stack(conv, dim=0)
+    data, conv = batch
     return data, conv
 
 
-def generate_data(V):
+def collate_fn_storage(batch):
+    return batch
+
+
+def generate_data(V, N=100):
     set_seed(42)
 
-    B = 100
+    B = N
     T = 128
     M = 32
     tensor1 = torch.randint(0, V, (B, M))
@@ -119,38 +169,6 @@ def train_likelihood(dataset, model: Qwen2ForCausalLM, epochs=3, learning_rate=1
 
 
 ############### Variational Training ####################################
-def generate_parallel_samples(
-    model,
-    pad_id,
-    tokenized_prompt,
-    max_length=100,
-    temperature=1.0,
-    device="cuda:0",
-):
-    model.to(device)
-    model.eval()
-
-    input_ids = tokenized_prompt["input_ids"].to(device)
-
-    # Repeat the input prompt n times
-    # input_ids = input_ids.repeat(n, 1)
-
-    with torch.no_grad():
-        outputs = model.generate(
-            input_ids=input_ids,
-            attention_mask=None,
-            max_length=max_length,
-            temperature=temperature,
-            do_sample=True,
-            top_k=50,
-            top_p=0.95,
-            pad_token_id=pad_id,
-        )
-
-    # Decode all outputs
-    return outputs
-
-
 def top_k_top_p_filtering(logits, top_k=0, top_p=1.0, filter_value=-9e15):
     """Apply top-k and/or nucleus (top-p) filtering to logits.
 
@@ -200,64 +218,6 @@ def top_k_top_p_filtering(logits, top_k=0, top_p=1.0, filter_value=-9e15):
     return logits
 
 
-def sample_with_probs(
-    model: Qwen2ForCausalLM,
-    tokenized_prompt,
-    n=1,
-    max_new_tokens=50,
-    temperature=1.0,
-    top_k=50,
-    top_p=0.95,
-    device="cuda" if torch.cuda.is_available() else "cpu",
-):
-    model.to(device)
-    model.eval()
-
-    input_ids = tokenized_prompt["input_ids"].to(device)
-    # input_ids = input_ids.repeat(n, 1)
-    generated_samples = []
-    probs_samples = []
-    for _ in range(n):
-        curr_input = input_ids.clone()
-        probs = []
-        # Initialize past_key_values (cache)
-        past_key_values = None
-        feed_input = curr_input
-        for _ in range(max_new_tokens):
-            outputs = model(input_ids=feed_input, past_key_values=past_key_values, use_cache=True)
-            logits = outputs.logits  # shape: [1, seq_len, vocab_size]
-            # Update past_key_values for the next step
-            past_key_values = outputs.past_key_values
-            next_token_logits = logits[:, -1, :]  # take last token
-
-            # Apply temperature
-            next_token_logits = next_token_logits / temperature
-            next_token_logits = top_k_top_p_filtering(next_token_logits, top_k=top_k, top_p=top_p)
-            # Convert to probabilities
-            log_probs = F.log_softmax(next_token_logits, dim=-1)
-            # Sample next token
-            dist = torch.distributions.Categorical(logits=log_probs)
-            next_token = dist.sample()  # shape: (batch_size,)
-            # Get prob of selected token
-            prob = log_probs[torch.arange(log_probs.shape[0]), next_token]
-            next_token = next_token.unsqueeze(1)
-            probs.append(prob)
-            feed_input = next_token
-            # Append token to input
-            curr_input = torch.cat([curr_input, next_token], dim=1)
-
-        probs = torch.stack(probs, dim=-1)
-        # get rid of the promt
-        curr_input = curr_input[:, input_ids.shape[1] :]
-        # print("Current input:", curr_input.shape)
-        # print("Current probs:", probs.shape)
-
-        generated_samples.append(curr_input)
-        probs_samples.append(probs)
-
-    return generated_samples, probs_samples
-
-
 def sample_with_probsV2(
     model: Qwen2ForCausalLM,
     tokenized_prompt,
@@ -280,6 +240,7 @@ def sample_with_probsV2(
         top_k (int, optional): _description_. Defaults to 50.
         top_p (float, optional): _description_. Defaults to 0.95.
         device (str, optional): _description_. Defaults to "cuda"iftorch.cuda.is_available()else"cpu".
+        rewards (torch.Tensor, optional): _description_. The log probs of the true label at posiiton t. Used for a specific type of reard (log prob reward)
 
     Returns:
         _type_: _description_
@@ -339,11 +300,11 @@ def compute_variationalOld(samples, log_probs):
     T = log_probs.shape[1]
     target = samples[-1]
     eps = 1e-30
-    R = (samples == target).all(dim=-1).float()  # .mean(dim=-1)
-    log_R = torch.log(R.float() + eps)
+    R = (samples == target).float().mean(dim=-1)  # .all(dim=-1)
+    log_R = torch.log(R + eps)
     # log_R = torch.where(R == 0, -9e20, log_R)
     log_prob_seq = log_probs.sum(dim=-1)
-    unnormalized_q = log_R + log_prob_seq
+    unnormalized_q = T * log_R + log_prob_seq
     dtype = unnormalized_q.dtype
     mini = torch.finfo(dtype).min
     unnormalized_q = torch.where(R == 0, mini, unnormalized_q)
@@ -356,62 +317,18 @@ def compute_variationalOld(samples, log_probs):
     return q, log_prob_seq
 
 
-def compute_variationalOld2(samples, log_probs, rewards):
-    target = samples[-1]
-    eps = 1e-30
-    # R = (samples == target).float().mean(dim=-1)
-    # log_R = torch.log(R + eps)
-    # log_R = torch.where(R == 0, -9e20, log_R)
-    log_R = rewards.sum(dim=-1)
-    log_prob_seq = log_probs.sum(dim=-1)
-    unnormalized_q = log_R + log_prob_seq
-    dtype = unnormalized_q.dtype
-    mini = torch.finfo(dtype).min
-    # unnormalized_q = torch.where(log_R == 0, mini, unnormalized_q)
-    q = torch.softmax(unnormalized_q, dim=0)
-    # print(R)
-    print(log_R)
-    print(q)
-    print(log_prob_seq)
-    print("DONE")
-    return q, log_prob_seq
-
-
-def compute_variational(samples, log_probs, embeds: nn.Module):
-    target = samples[-1]
-    # print(target.shape)
-    # target = F.one_hot(target, num_classes=log_probs.shape[-1])
-    with torch.no_grad():
-        target = embeds(target)
-        samples = embeds(samples)
-
-    R = samples - target
-    R = -(R**2).sum(dim=-1)
-    log_R = torch.logsumexp(R, dim=-1)
-    # log_R = torch.log(R.float() + eps)
-    log_prob_seq = log_probs.sum(dim=-1)
-    unnormalized_q = log_R + log_prob_seq
-    q = torch.softmax(unnormalized_q, dim=0)
-    print(log_R)
-    print(q)
-    print(log_prob_seq)
-    print("DONE")
-    return q, log_prob_seq
-
-
-def soft_update(target_model, source_model, tau=0.005):
-    for target_param, param in zip(target_model.parameters(), source_model.parameters()):
-        target_param.data.copy_(tau * param.data.to(target_param.device) + (1.0 - tau) * target_param.data)
-
-
 def train_variational(
-    dataset, model: Qwen2ForCausalLM, config: Qwen2Config, epochs=3, learning_rate=1e-4, batch_size=2
+    dataset,
+    model: Qwen2ForCausalLM,
+    config: Qwen2Config,
+    epochs=3,
+    learning_rate=1e-4,
+    batch_size=2,
+    internal_batch_size=32,
 ):
-    N_SAMPLES = 3
+    internal_updates = 100
     device = "cuda:0"
-    device2 = "cuda:1"
     pad_id = config.pad_token_id
-    target_model = copy.deepcopy(model)  # CPU-based clone
 
     model.to(device)
     # target_model.to(device2)
@@ -423,44 +340,39 @@ def train_variational(
     model.train()
     for epoch in tqdm(range(epochs)):
         total_loss = 0
+        loss_iterative = []
+        it = 0
         for step, (input_ids, conv) in enumerate(loader):
             all_data, conv = input_ids.to(device), conv.to(device)
-            prompt = all_data[:, : -conv.shape[1]]
-            # print("Shape of prompt:", prompt.shape)
-            generated_samples, log_probs_samples, rewards = sample_with_probsV2(
-                model,
-                {"input_ids": prompt},
-                conv,
-                n=N_SAMPLES,
-                max_new_tokens=conv.shape[1],
-                temperature=1.0,
-                device=device,
+            storage = Storage.generate_samples(all_data, conv, model, device)
+
+            storage_dl = DataLoader(
+                storage, batch_size=internal_batch_size, shuffle=True, collate_fn=collate_fn_storage
             )
-            generated_samples = generated_samples.to(device)
-            log_probs_samples = log_probs_samples.to(device)
-            # add the true label
-            outputs = model(input_ids=all_data)
-            log_probs = F.log_softmax(outputs.logits, dim=-1)
-            log_probs = log_probs[:, prompt.shape[-1] - 1 : -1, :]
-            # loss = loss_fn(log_probs.reshape(-1, log_probs.size(-1)), conv.reshape(-1))
+            for l in range(internal_updates):
+                for promt, samples, old_log_probs, q in storage_dl:
+                    B, S, T = samples.shape
+                    samples = samples.reshape(-1, samples.shape[-1])
+                    outputs = model(input_ids=samples)
+                    log_probs = F.log_softmax(outputs.logits, dim=-1)
+                    log_probs = log_probs[:, promt.shape[-1] - 1 : -1, :]
+                    completion = samples[:, promt.shape[-1] :]
+                    log_probs = log_probs.gather(dim=-1, index=completion.unsqueeze(-1)).squeeze(-1)
+                    log_probs = log_probs.reshape(B, S, log_probs.shape[-1])
 
-            log_probs = log_probs.gather(dim=-1, index=conv.unsqueeze(-1))
-            log_probs = log_probs.squeeze(-1)
+                    log_prob_seq = log_probs.sum(dim=-1)
+                    loss = -torch.mean(q * log_prob_seq)  # - 100 * log_probs.mean()
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
+                    scheduler.step()
+                    it += 1
+                    loss_iterative.append(loss.item())
 
-            generated_samples = torch.cat([generated_samples, conv.unsqueeze(0)], dim=0)
-            log_probs_samples = torch.cat([log_probs_samples, log_probs.unsqueeze(0)], dim=0)
-            # rewards = torch.cat([rewards, log_probs.unsqueeze(0)], dim=0)
-            rewards = torch.cat([rewards, torch.zeros_like(log_probs).unsqueeze(0)], dim=0)
-            # Compute logits for all samples
-            # q, log_prob_seq = compute_variational(generated_samples, log_probs_samples, model.get_input_embeddings())
-            q, log_prob_seq = compute_variationalOld2(generated_samples, log_probs_samples, rewards)
-            loss = -torch.mean(q * log_prob_seq)  # - 100 * log_probs.mean()
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            scheduler.step()
-            # if epoch % 10 == 0:
-            #     soft_update(target_model, model)
+                    if it % 10 == 0:
+                        print(f"Step {it} | Loss: {np.mean(loss_iterative):.4f}")
+                        loss_iterative = []
+
             total_loss += loss.item()
 
         avg_loss = total_loss / len(loader)
@@ -470,14 +382,14 @@ def train_variational(
 
 def main():
     V = 100
-    tensor1, tensor2 = generate_data(V)
+    tensor1, tensor2 = generate_data(V, N=10)
     dataset = PairedTensorDataset(tensor1, tensor2)
     print(len(dataset))
     model, config = get_model(V)
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Total parameters: {total_params / 10**6}M")
     # train_likelihood(dataset, model, epochs=100, learning_rate=1e-3, batch_size=32)
-    model = train_variational(dataset, model, config=config, epochs=70, learning_rate=1e-3, batch_size=32)
+    model = train_variational(dataset, model, config=config, epochs=70, learning_rate=1e-3, batch_size=20)
     model.eval()
     model.to("cuda:0")
     promt = tensor1[0:32, :]
@@ -494,8 +406,8 @@ def main():
     #     pad_token_id=V,
     # )
 
-    generated_samples, log_sample_prob = sample_with_probsV2(
-        model, {"input_ids": promt}, n=1, max_new_tokens=conv.shape[1]
+    generated_samples, log_sample_prob, _ = sample_with_probsV2(
+        model, {"input_ids": promt}, n=1, max_new_tokens=conv.shape[1], conv=conv
     )
     generated_samples = generated_samples[0]
     print(generated_samples.shape, log_sample_prob.shape)
@@ -504,4 +416,8 @@ def main():
 
 
 if __name__ == "__main__":
+    """
+    This is a toy example to test the variational training on a toy dataset. Tries to fixx errors in dummy script (the original version)
+    python -m src.quick_test.toy_data2
+    """
     main()
